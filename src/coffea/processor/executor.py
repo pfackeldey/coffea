@@ -850,6 +850,8 @@ class DaskExecutor(ExecutorBase):
             def belongsto(heavy_input, workerindex, item):
                 if heavy_input is not None:
                     item = item[0]
+                if isinstance(item, tuple):
+                    item = item[0]
                 hashed = _hash(
                     (item.fileuuid, item.treename, item.entrystart, item.entrystop)
                 )
@@ -1185,6 +1187,7 @@ class Runner:
     pre_executor: ExecutorBase | None = None
     chunksize: int = 100000
     maxchunks: int | None = None
+    group_chunks_across_files: bool = False
     metadata_cache: MutableMapping | None = None
     skipbadfiles: bool | tuple[type[BaseException], ...] = False
     xrootdtimeout: int | None = 60
@@ -1572,13 +1575,42 @@ class Runner:
             yield from (c for c in chunks)
 
     @staticmethod
+    def _group_chunks_across_files(chunks: list[WorkItem], chunksize: int) -> Generator:
+        group = []
+        group_entries = 0
+
+        def compatible(chunk, group):
+            first = group[0]
+            return (
+                chunk.dataset == first.dataset
+                and chunk.treename == first.treename
+                and chunk.usermeta == first.usermeta
+                and chunk.preload == first.preload
+                and all(chunk.filename != grouped.filename for grouped in group)
+            )
+
+        for chunk in chunks:
+            if group and (
+                not compatible(chunk, group)
+                or (group_entries and group_entries + len(chunk) > chunksize)
+            ):
+                yield tuple(group) if len(group) > 1 else group[0]
+                group = []
+                group_entries = 0
+            group.append(chunk)
+            group_entries += len(chunk)
+
+        if group:
+            yield tuple(group) if len(group) > 1 else group[0]
+
+    @staticmethod
     def _work_function(
         format: str,
         xrootdtimeout: int,
         schema: schemas.BaseSchema,
         use_dataframes: bool,
         savemetrics: bool,
-        item: WorkItem,
+        item: WorkItem | tuple[WorkItem, ...],
         processor_instance: ProcessorABC | Callable[[awkward.highlevel.Array], Any],
         uproot_options: dict,
         iteritems_options: dict,
@@ -1594,15 +1626,25 @@ class Runner:
         ):
             processor_instance = cloudpickle.loads(lz4f.decompress(processor_instance))
 
+        items = item if isinstance(item, tuple) else (item,)
+        item = items[0]
+        fileuuids = [
+            str(uuid.UUID(bytes=i.fileuuid)) if len(i.fileuuid) > 0 else ""
+            for i in items
+        ]
         metadata = {
             "dataset": item.dataset,
-            "filename": item.filename,
-            "treename": item.treename,
-            "entrystart": item.entrystart,
-            "entrystop": item.entrystop,
-            "fileuuid": (
-                str(uuid.UUID(bytes=item.fileuuid)) if len(item.fileuuid) > 0 else ""
+            "filename": (
+                item.filename if len(items) == 1 else [i.filename for i in items]
             ),
+            "treename": item.treename,
+            "entrystart": (
+                item.entrystart if len(items) == 1 else [i.entrystart for i in items]
+            ),
+            "entrystop": (
+                item.entrystop if len(items) == 1 else [i.entrystop for i in items]
+            ),
+            "fileuuid": fileuuids[0] if len(items) == 1 else fileuuids,
         }
         if item.usermeta is not None:
             metadata.update(item.usermeta)
@@ -1616,58 +1658,69 @@ class Runner:
             if out is not None:
                 return out
 
-        try:
-            if format == "root":
-                filecontext = uproot.open(
-                    {item.filename: None},
-                    timeout=xrootdtimeout,
-                    **uproot_options,
-                )
-            elif format == "parquet":
-                filecontext = ParquetFileContext(item.filename)
-        except Exception as e:
-            raise Exception(
-                f"Failed to open file: {item!r}. The error was: {e!r}."
-            ) from e
+        with ExitStack() as stack:
+            files = []
+            try:
+                for item in items:
+                    if format == "root":
+                        filecontext = uproot.open(
+                            {item.filename: None},
+                            timeout=xrootdtimeout,
+                            **uproot_options,
+                        )
+                    elif format == "parquet":
+                        filecontext = ParquetFileContext(item.filename)
+                    files.append(stack.enter_context(filecontext))
+            except Exception as e:
+                raise Exception(
+                    f"Failed to open file: {items!r}. The error was: {e!r}."
+                ) from e
 
-        with filecontext as file:
             if schema is None:
                 raise ValueError("Schema must be set")
             elif issubclass(schema, schemas.BaseSchema):
                 try:
-                    # change here
-                    if format == "root":
-                        materialized = []
-                        factory = NanoEventsFactory.from_root(
-                            file=file,
-                            treepath=item.treename,
-                            schemaclass=schema,
-                            metadata=metadata,
-                            access_log=materialized,
-                            mode="virtual",
-                            entry_start=item.entrystart,
-                            entry_stop=item.entrystop,
-                            iteritems_options=iteritems_options,
-                            preload=item.preload,
-                            buffer_cache=cache_function(),
-                        )
-                        events = factory.events()
-                    elif format == "parquet":
-                        materialized = []
-                        factory = NanoEventsFactory.from_parquet(
-                            file=item.filename,
-                            schemaclass=schema,
-                            metadata=metadata,
-                            mode="virtual",
-                            entry_start=item.entrystart,
-                            entry_stop=item.entrystop,
-                            access_log=materialized,
-                            buffer_cache=cache_function(),
-                        )
-                        events = factory.events()
+                    materialized = []
+
+                    def make_events(item, file):
+                        if format == "root":
+                            factory = NanoEventsFactory.from_root(
+                                file=file,
+                                treepath=item.treename,
+                                schemaclass=schema,
+                                metadata=metadata,
+                                access_log=materialized,
+                                mode="virtual",
+                                entry_start=item.entrystart,
+                                entry_stop=item.entrystop,
+                                iteritems_options=iteritems_options,
+                                preload=item.preload,
+                                buffer_cache=cache_function(),
+                            )
+                        elif format == "parquet":
+                            factory = NanoEventsFactory.from_parquet(
+                                file=item.filename,
+                                schemaclass=schema,
+                                metadata=metadata,
+                                mode="virtual",
+                                entry_start=item.entrystart,
+                                entry_stop=item.entrystop,
+                                access_log=materialized,
+                                buffer_cache=cache_function(),
+                            )
+                        return factory.events()
+
+                    events = [
+                        make_events(item, file) for item, file in zip(items, files)
+                    ]
+                    events = (
+                        events[0]
+                        if len(events) == 1
+                        else awkward.concatenate(events, axis=0)
+                    )
                 except Exception as e:
                     raise Exception(
-                        f"Failed creating nanoevents: {item!r}. The error was: {e!r}."
+                        f"Failed creating nanoevents: {items!r}. The error was: {e!r}."
                     ) from e
             else:
                 raise ValueError(
@@ -1682,7 +1735,7 @@ class Runner:
                     out = processor_instance(events)
             except Exception as e:
                 raise Exception(
-                    f"Failed processing file: {item!r}. The error was: {e!r}."
+                    f"Failed processing file: {items!r}. The error was: {e!r}."
                 ) from e
             if out is None:
                 raise ValueError(
@@ -1692,8 +1745,13 @@ class Runner:
             if not use_dataframes:
                 if savemetrics:
                     metrics = {}
-                    if isinstance(file, uproot.ReadOnlyDirectory):
-                        metrics["bytesread"] = file.file.source.num_requested_bytes
+                    bytesread = sum(
+                        file.file.source.num_requested_bytes
+                        for file in files
+                        if isinstance(file, uproot.ReadOnlyDirectory)
+                    )
+                    if bytesread:
+                        metrics["bytesread"] = bytesread
                     if schema is not None and issubclass(schema, schemas.BaseSchema):
                         metrics["columns"] = {
                             f"{x.branch}-{key_to_tuple(x.buffer_key)[3]}"
@@ -1701,9 +1759,9 @@ class Runner:
                         }
                         metrics["entries"] = len(events)
                     metrics["processtime"] = toc - tic
-                    out = {"out": out, "metrics": metrics, "processed": {item}}
+                    out = {"out": out, "metrics": metrics, "processed": set(items)}
                 else:
-                    out = {"out": out, "processed": {item}}
+                    out = {"out": out, "processed": set(items)}
 
             if checkpointer is not None:
                 if not isinstance(checkpointer, CheckpointerABC):
@@ -2006,6 +2064,10 @@ class Runner:
             raise ValueError(
                 "Expected processor_instance to derive from ProcessorABC or be a single-argument callable"
             )
+        if self.group_chunks_across_files and self.checkpointer is not None:
+            raise ValueError(
+                "group_chunks_across_files is not compatible with checkpointing"
+            )
 
         meta = False
         if not isinstance(fileset, (Mapping, str)):
@@ -2066,6 +2128,8 @@ class Runner:
             )
 
         chunks = list(chunks)
+        if self.group_chunks_across_files:
+            chunks = list(self._group_chunks_across_files(chunks, self.chunksize))
         if len(chunks) == 0:
             raise ValueError(
                 "No chunks survived preprocessing.\n"

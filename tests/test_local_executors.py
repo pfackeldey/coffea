@@ -1,12 +1,13 @@
 import os.path as osp
 
+import awkward as ak
 import pyarrow
 import pytest
 
 from coffea import processor
 from coffea.nanoevents import schemas
 from coffea.processor import Err, Ok
-from coffea.processor.executor import UprootMissTreeError
+from coffea.processor.executor import UprootMissTreeError, WorkItem
 from coffea.processor.test_items import NanoEventsProcessor
 
 _exceptions = (FileNotFoundError, UprootMissTreeError, pyarrow.ArrowInvalid)
@@ -237,6 +238,74 @@ def test_preprocessing(align_clusters, filetype):
             "empty_and_nonempty": 40,
             "only_nonempty": 40,
         }
+
+
+def test_group_chunks_across_files_concatenates_small_files():
+    fileset = {
+        "Grouped": {
+            "treename": "Events",
+            "files": [
+                osp.abspath("tests/samples/nano_dy.root"),
+                osp.abspath("tests/samples/nano_dimuon.root"),
+            ],
+        }
+    }
+
+    run = processor.Runner(
+        executor=processor.IterativeExecutor(),
+        schema=schemas.NanoAODSchema,
+        chunksize=100000,
+        group_chunks_across_files=True,
+        savemetrics=True,
+    )
+    chunks = list(run.preprocess(fileset))
+    assert len(chunks) == 2
+    expected_entries = sum(len(chunk) for chunk in chunks)
+
+    def data_manipulation(events):
+        assert events.metadata["dataset"] == "Grouped"
+        assert events.metadata["filename"] == fileset["Grouped"]["files"]
+        return {
+            "entries": len(events),
+            "muons": ak.sum(ak.num(events.Muon, axis=1)),
+        }
+
+    out, metrics = run(fileset, data_manipulation)
+    assert out["entries"] == expected_entries
+    assert out["muons"] > 0
+    assert metrics["chunks"] == 1
+    assert metrics["entries"] == expected_entries
+
+
+def test_group_chunks_across_files_respects_boundaries():
+    chunks = [
+        WorkItem("A", "a.root", "Events", 0, 4, b"", {"x": 1}),
+        WorkItem("A", "b.root", "Events", 0, 4, b"", {"x": 1}),
+        WorkItem("A", "c.root", "Events", 0, 4, b"", {"x": 1}),
+        WorkItem("A", "d.root", "OtherEvents", 0, 1, b"", {"x": 1}),
+        WorkItem("A", "e.root", "OtherEvents", 0, 1, b"", {"x": 2}),
+    ]
+
+    grouped = list(processor.Runner._group_chunks_across_files(chunks, 10))
+    assert grouped == [
+        (chunks[0], chunks[1]),
+        chunks[2],
+        chunks[3],
+        chunks[4],
+    ]
+
+
+def test_group_chunks_across_files_rejects_checkpointing():
+    run = processor.Runner(
+        executor=processor.IterativeExecutor(),
+        schema=schemas.NanoAODSchema,
+        group_chunks_across_files=True,
+        checkpointer=object(),
+    )
+    chunks = [WorkItem("A", "a.root", "Events", 0, 1, b"")]
+
+    with pytest.raises(ValueError, match="not compatible with checkpointing"):
+        run.run(chunks, processor_instance=lambda events: {"entries": len(events)})
 
 
 _good_fileset = {
